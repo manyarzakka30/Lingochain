@@ -27,6 +27,18 @@
 (define-constant MIN_RESOURCE_PRICE u10000)
 (define-constant MAX_RATING u5)
 (define-constant MARKETPLACE_FEE_PERCENTAGE u5)
+(define-constant ERR_BOUNTY_NOT_FOUND (err u113))
+(define-constant ERR_SUBMISSION_NOT_FOUND (err u114))
+(define-constant ERR_BOUNTY_EXPIRED (err u115))
+(define-constant ERR_ALREADY_SUBMITTED (err u116))
+(define-constant ERR_BOUNTY_NOT_ACTIVE (err u117))
+(define-constant ERR_VOTING_NOT_ACTIVE (err u118))
+(define-constant ERR_BOUNTY_NOT_ENDED (err u119))
+(define-constant ERR_ALREADY_CLAIMED (err u120))
+(define-constant MIN_BOUNTY_AMOUNT u50000)
+(define-constant BOUNTY_SUBMISSION_PERIOD u288)
+(define-constant BOUNTY_VOTING_PERIOD u144)
+(define-constant MAX_SUBMISSIONS_PER_BOUNTY u20)
 
 ;; data vars
 (define-data-var proposal-counter uint u0)
@@ -34,6 +46,7 @@
 (define-data-var treasury-balance uint u0)
 (define-data-var resource-counter uint u0)
 (define-data-var marketplace-revenue uint u0)
+(define-data-var bounty-counter uint u0)
 
 ;; data maps
 (define-map members principal bool)
@@ -112,6 +125,40 @@
     total-sales: uint,
     average-rating: uint,
     resources-listed: uint
+})
+(define-map translation-bounties uint {
+    id: uint,
+    creator: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    source-language: (string-ascii 50),
+    target-language: (string-ascii 50),
+    content-type: (string-ascii 20),
+    source-content: (string-ascii 1000),
+    bounty-amount: uint,
+    submission-count: uint,
+    status: (string-ascii 20),
+    created-block: uint,
+    submission-deadline: uint,
+    voting-deadline: uint,
+    winner-submission-id: uint,
+    claimed: bool
+})
+(define-map bounty-submissions uint {
+    id: uint,
+    bounty-id: uint,
+    translator: principal,
+    translation: (string-ascii 1000),
+    notes: (string-ascii 200),
+    votes: uint,
+    submitted-block: uint
+})
+(define-map bounty-votes {bounty-id: uint, voter: principal} uint)
+(define-map translator-stats principal {
+    total-submissions: uint,
+    won-bounties: uint,
+    total-earned: uint,
+    average-rating: uint
 })
 
 ;; public functions
@@ -329,6 +376,115 @@
     )
 )
 
+(define-public (create-translation-bounty (title (string-ascii 100))
+                                         (description (string-ascii 500))
+                                         (source-language (string-ascii 50))
+                                         (target-language (string-ascii 50))
+                                         (content-type (string-ascii 20))
+                                         (source-content (string-ascii 1000))
+                                         (bounty-amount uint))
+    (let ((bounty-id (+ (var-get bounty-counter) u1))
+          (creator tx-sender)
+          (submission-deadline (+ stacks-block-height BOUNTY_SUBMISSION_PERIOD))
+          (voting-deadline (+ submission-deadline BOUNTY_VOTING_PERIOD)))
+        (asserts! (is-member creator) ERR_UNAUTHORIZED)
+        (asserts! (>= bounty-amount MIN_BOUNTY_AMOUNT) ERR_INVALID_AMOUNT)
+        (try! (stx-transfer? bounty-amount creator (as-contract tx-sender)))
+        (map-set translation-bounties bounty-id {
+            id: bounty-id,
+            creator: creator,
+            title: title,
+            description: description,
+            source-language: source-language,
+            target-language: target-language,
+            content-type: content-type,
+            source-content: source-content,
+            bounty-amount: bounty-amount,
+            submission-count: u0,
+            status: "active",
+            created-block: stacks-block-height,
+            submission-deadline: submission-deadline,
+            voting-deadline: voting-deadline,
+            winner-submission-id: u0,
+            claimed: false
+        })
+        (var-set bounty-counter bounty-id)
+        (ok bounty-id)
+    )
+)
+
+(define-public (submit-translation (bounty-id uint)
+                                  (translation (string-ascii 1000))
+                                  (notes (string-ascii 200)))
+    (let ((translator tx-sender)
+          (bounty (unwrap! (map-get? translation-bounties bounty-id) ERR_BOUNTY_NOT_FOUND))
+          (submission-id (+ (* bounty-id u1000) (get submission-count bounty))))
+        (asserts! (is-member translator) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status bounty) "active") ERR_BOUNTY_NOT_ACTIVE)
+        (asserts! (< stacks-block-height (get submission-deadline bounty)) ERR_BOUNTY_EXPIRED)
+        (asserts! (< (get submission-count bounty) MAX_SUBMISSIONS_PER_BOUNTY) ERR_INVALID_AMOUNT)
+        (asserts! (not (is-eq translator (get creator bounty))) ERR_CANNOT_PURCHASE_OWN)
+        (map-set bounty-submissions submission-id {
+            id: submission-id,
+            bounty-id: bounty-id,
+            translator: translator,
+            translation: translation,
+            notes: notes,
+            votes: u0,
+            submitted-block: stacks-block-height
+        })
+        (map-set translation-bounties bounty-id 
+            (merge bounty {submission-count: (+ (get submission-count bounty) u1)}))
+        (let ((result (update-translator-submissions translator))) true)
+        (ok submission-id)
+    )
+)
+
+(define-public (vote-on-translation (bounty-id uint) (submission-id uint))
+    (let ((voter tx-sender)
+          (bounty (unwrap! (map-get? translation-bounties bounty-id) ERR_BOUNTY_NOT_FOUND))
+          (submission (unwrap! (map-get? bounty-submissions submission-id) ERR_SUBMISSION_NOT_FOUND)))
+        (asserts! (is-member voter) ERR_UNAUTHORIZED)
+        (asserts! (>= stacks-block-height (get submission-deadline bounty)) ERR_VOTING_NOT_ACTIVE)
+        (asserts! (< stacks-block-height (get voting-deadline bounty)) ERR_VOTING_ENDED)
+        (asserts! (is-none (map-get? bounty-votes {bounty-id: bounty-id, voter: voter})) ERR_ALREADY_VOTED)
+        (asserts! (is-eq (get bounty-id submission) bounty-id) ERR_SUBMISSION_NOT_FOUND)
+        (map-set bounty-votes {bounty-id: bounty-id, voter: voter} submission-id)
+        (map-set bounty-submissions submission-id 
+            (merge submission {votes: (+ (get votes submission) u1)}))
+        (ok true)
+    )
+)
+
+(define-public (finalize-bounty (bounty-id uint) (winner-submission-id uint))
+    (let ((bounty (unwrap! (map-get? translation-bounties bounty-id) ERR_BOUNTY_NOT_FOUND))
+          (winning-submission (unwrap! (map-get? bounty-submissions winner-submission-id) ERR_SUBMISSION_NOT_FOUND)))
+        (asserts! (>= stacks-block-height (get voting-deadline bounty)) ERR_BOUNTY_NOT_ENDED)
+        (asserts! (is-eq (get status bounty) "active") ERR_BOUNTY_NOT_ACTIVE)
+        (asserts! (is-eq (get bounty-id winning-submission) bounty-id) ERR_SUBMISSION_NOT_FOUND)
+        (map-set translation-bounties bounty-id 
+            (merge bounty {
+                status: "completed",
+                winner-submission-id: winner-submission-id
+            }))
+        (ok winner-submission-id)
+    )
+)
+
+(define-public (claim-bounty-reward (bounty-id uint))
+    (let ((bounty (unwrap! (map-get? translation-bounties bounty-id) ERR_BOUNTY_NOT_FOUND))
+          (winning-submission (unwrap! (map-get? bounty-submissions (get winner-submission-id bounty)) ERR_SUBMISSION_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get translator winning-submission)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status bounty) "completed") ERR_BOUNTY_NOT_ACTIVE)
+        (asserts! (not (get claimed bounty)) ERR_ALREADY_CLAIMED)
+        (try! (as-contract (stx-transfer? (get bounty-amount bounty) tx-sender (get translator winning-submission))))
+        (map-set translation-bounties bounty-id 
+            (merge bounty {claimed: true}))
+        (let ((result (update-translator-wins (get translator winning-submission) (get bounty-amount bounty)))) true)
+        (ok (get bounty-amount bounty))
+    )
+)
+
 ;; read only functions
 (define-read-only (get-proposal (proposal-id uint))
     (map-get? proposals proposal-id)
@@ -507,6 +663,42 @@
 
 (define-read-only (has-purchased-resource (resource-id uint) (buyer principal))
     (is-some (map-get? resource-purchases {resource-id: resource-id, buyer: buyer}))
+)
+
+(define-read-only (get-translation-bounty (bounty-id uint))
+    (map-get? translation-bounties bounty-id)
+)
+
+(define-read-only (get-bounty-submission (submission-id uint))
+    (map-get? bounty-submissions submission-id)
+)
+
+(define-read-only (get-translator-stats (translator principal))
+    (map-get? translator-stats translator)
+)
+
+(define-read-only (get-bounty-vote (bounty-id uint) (voter principal))
+    (map-get? bounty-votes {bounty-id: bounty-id, voter: voter})
+)
+
+(define-read-only (get-bounty-counter)
+    (var-get bounty-counter)
+)
+
+(define-read-only (is-bounty-active (bounty-id uint))
+    (match (map-get? translation-bounties bounty-id)
+        bounty (and (is-eq (get status bounty) "active")
+                   (< stacks-block-height (get submission-deadline bounty)))
+        false
+    )
+)
+
+(define-read-only (is-bounty-voting-active (bounty-id uint))
+    (match (map-get? translation-bounties bounty-id)
+        bounty (and (>= stacks-block-height (get submission-deadline bounty))
+                   (< stacks-block-height (get voting-deadline bounty)))
+        false
+    )
 )
 
 ;; private functions
@@ -709,3 +901,27 @@
         )
     )
 )
+
+(define-private (update-translator-submissions (translator principal))
+    (let ((current-stats (default-to {total-submissions: u0, won-bounties: u0, total-earned: u0, average-rating: u0} 
+                                    (map-get? translator-stats translator))))
+        (map-set translator-stats translator 
+            (merge current-stats {total-submissions: (+ (get total-submissions current-stats) u1)}))
+        (ok true)
+    )
+)
+
+(define-private (update-translator-wins (translator principal) (amount uint))
+    (let ((current-stats (default-to {total-submissions: u0, won-bounties: u0, total-earned: u0, average-rating: u0} 
+                                    (map-get? translator-stats translator))))
+        (map-set translator-stats translator 
+            (merge current-stats {
+                won-bounties: (+ (get won-bounties current-stats) u1),
+                total-earned: (+ (get total-earned current-stats) amount)
+            }))
+        (ok true)
+    )
+)
+
+
+
