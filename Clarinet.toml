@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Lingochain.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.LanguageLearning]
+path = 'contracts/LanguageLearning.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
